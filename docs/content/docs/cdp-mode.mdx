@@ -75,6 +75,31 @@ This is useful when:
 - You want a zero-configuration connection to your existing browser
 - You don't want to track which port Chrome is using
 
+## Always-quiet attach (background targets)
+
+When you attach with `--cdp` / `--auto-connect` (or `connect`), agent-browser uses an **AlwaysQuiet** raise policy:
+
+- `Target.createTarget` always passes `background: true` — new agent tabs do not activate in Chrome.
+- `tab switch` updates agent routing only — it does **not** call `Page.bringToFront`.
+- Memory Saver revival via `Target.activateTarget` is **refused** on the quiet path (would steal focus). Use `revive-tab` when you intentionally accept that steal.
+- Agent-created sessions get `Emulation.setFocusEmulationEnabled` automatically so background pages stay operable.
+- The only intentional Chrome raise is `bringtofront` (optional tab ref).
+
+```bash
+# Dedicated test profile recommended — not your daily browser profile.
+brave --remote-debugging-port=9222 --user-data-dir=/tmp/agent-browser-proof-profile
+
+agent-browser --cdp 9222 tab new https://example.com/agent
+agent-browser --cdp 9222 snapshot          # agent-active; Chrome UI unchanged
+agent-browser --cdp 9222 tab t0            # agent routing only
+agent-browser --cdp 9222 bringtofront      # ONLY intentional Chrome raise
+agent-browser --cdp 9222 revive-tab        # intentional Memory Saver activateTarget
+```
+
+Launched **headed** agent-owned browsers keep today's foreground-create / raise-on-switch behavior (`AllowForegroundCreate`). There is no public `--background` flag on the happy path — quiet is the attach default.
+
+Residual risks: macOS may still activate Chrome on CDP WebSocket connect (outside this raise gate); discarded tabs need `revive-tab` or a quiet `tab new`.
+
 ## Tab pinning
 
 When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's.

@@ -142,6 +142,8 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "storage"
             | "cookies"
             | "tab"
+            | "bringtofront"
+            | "revive-tab"
             | "window"
             | "frame"
             | "dialog"
@@ -1696,6 +1698,21 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 None => Ok(json!({ "id": id, "action": "tab_list" })),
             }
         }
+
+        // === Explicit Chrome raise (AlwaysQuiet attach default) ===
+        "bringtofront" => {
+            let mut cmd = json!({ "id": id, "action": "bringtofront" });
+            if let Some(tab_ref) = rest.first() {
+                // Optional tab ref: switch agent-active quietly first is NOT done here;
+                // bringtofront raises the current agent-active tab. If a tab ref is
+                // given, include it so the daemon can switch-then-raise intentionally.
+                cmd["tabId"] = json!(tab_ref);
+            }
+            Ok(cmd)
+        }
+
+        // === Explicit Memory Saver revive (documented focus steal) ===
+        "revive-tab" => Ok(json!({ "id": id, "action": "revive_tab" })),
 
         // === Window ===
         "window" => {

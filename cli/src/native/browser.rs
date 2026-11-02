@@ -289,7 +289,46 @@ fn is_locator_miss(lower: &str) -> bool {
         || lower.starts_with("no element at index")
 }
 
-#[derive(Debug, Clone)]
+/// Quiet policy for Chrome create/raise. Connection-mode invariant — not a
+/// caller flag. Attach (`--cdp` / `--auto-connect`) and launched-headless are
+/// AlwaysQuiet; launched-headed keeps AllowForegroundCreate (today's raise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaisePolicy {
+    /// Create with background:true; never implicit Page.bringToFront;
+    /// activateTarget revival gated (use revive_tab); explicit bring_to_front only.
+    AlwaysQuiet,
+    /// Agent-launched headed browser may foreground-create and raise on switch.
+    AllowForegroundCreate,
+}
+
+impl RaisePolicy {
+    pub fn creates_in_background(self) -> bool {
+        matches!(self, RaisePolicy::AlwaysQuiet)
+    }
+
+    pub fn is_always_quiet(self) -> bool {
+        matches!(self, RaisePolicy::AlwaysQuiet)
+    }
+
+    pub fn allows_implicit_bring_to_front(self) -> bool {
+        matches!(self, RaisePolicy::AllowForegroundCreate)
+    }
+
+    pub fn allows_implicit_activate_target(self) -> bool {
+        matches!(self, RaisePolicy::AllowForegroundCreate)
+    }
+}
+
+/// Who created this CDP target relative to the agent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetOrigin {
+    /// tab_new / click --new-tab / window new / auto-connect fresh / ensure_page agent path
+    AgentCreated,
+    /// Discovered from getTargets / Target events; never auto focus-emulate
+    UserDiscovered,
+}
+
+#[derive(Clone)]
 pub struct PageInfo {
     pub tab_id: u32,
     /// Optional user-assigned label (e.g. "docs", "app"). Set via
@@ -303,6 +342,40 @@ pub struct PageInfo {
     pub url: String,
     pub title: String,
     pub target_type: String, // "page" or "webview"
+    /// AgentCreated vs UserDiscovered — focus emulation only on AgentCreated.
+    pub origin: TargetOrigin,
+    /// Target.createTarget.background was true for this page.
+    pub created_in_background: bool,
+    /// Emulation.setFocusEmulationEnabled applied on this session.
+    pub focus_emulation: bool,
+    /// Raised via create/activate/bringToFront (Chrome UI foreground).
+    pub chrome_foreground: bool,
+}
+
+impl PageInfo {
+    /// Construct a page row with quiet-safe defaults (UserDiscovered, not foreground).
+    pub fn new(
+        tab_id: u32,
+        target_id: impl Into<String>,
+        session_id: impl Into<String>,
+        url: impl Into<String>,
+        title: impl Into<String>,
+        target_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            tab_id,
+            label: None,
+            target_id: target_id.into(),
+            session_id: session_id.into(),
+            url: url.into(),
+            title: title.into(),
+            target_type: target_type.into(),
+            origin: TargetOrigin::UserDiscovered,
+            created_in_background: false,
+            focus_emulation: false,
+            chrome_foreground: false,
+        }
+    }
 }
 
 /// Canonical string form of a stable tab id: `t1`, `t2`, ... The `t` prefix
@@ -525,6 +598,9 @@ pub struct BrowserManager {
     /// launch rules such as extension-forced headed mode. Meaningless for
     /// attached browsers (browser_process is None).
     headless: bool,
+    /// Create/raise policy. Attach and headless launch → AlwaysQuiet;
+    /// headed launch → AllowForegroundCreate.
+    raise_policy: RaisePolicy,
 }
 
 /// Stable machine-readable prefix for "the bound tab no longer exists"
@@ -728,6 +804,11 @@ impl BrowserManager {
                 bound_target_gone: None,
                 wedge_suspect: None,
                 headless,
+                raise_policy: if headless {
+                    RaisePolicy::AlwaysQuiet
+                } else {
+                    RaisePolicy::AllowForegroundCreate
+                },
             };
             if let Err(error) = manager.discover_and_attach_targets().await {
                 let _ = manager
@@ -837,6 +918,7 @@ impl BrowserManager {
             bound_target_gone: None,
             wedge_suspect: None,
             headless: true,
+            raise_policy: RaisePolicy::AlwaysQuiet,
         };
 
         let initialization = if direct_page {
@@ -849,6 +931,10 @@ impl BrowserManager {
                 url: String::new(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                origin: TargetOrigin::UserDiscovered,
+                created_in_background: false,
+                focus_emulation: false,
+                chrome_foreground: false,
             });
             manager.active_page_index = 0;
             manager.enable_domains_direct().await
@@ -890,44 +976,31 @@ impl BrowserManager {
             .collect();
 
         if page_targets.is_empty() {
-            // Create a new tab
-            let result: CreateTargetResult = self
-                .client
-                .send_command_typed(
-                    "Target.createTarget",
-                    &CreateTargetParams {
-                        url: "about:blank".to_string(),
-                    },
-                    None,
-                )
+            // Agent-created blank under Quiet policy (background:true on attach).
+            let (target_id, session_id, created_in_background) = self
+                .create_and_attach_target("about:blank", None)
                 .await?;
-
-            let attach_result: AttachToTargetResult = self
-                .client
-                .send_command_typed(
-                    "Target.attachToTarget",
-                    &AttachToTargetParams {
-                        target_id: result.target_id.clone(),
-                        flatten: true,
-                    },
-                    None,
-                )
+            let origin = TargetOrigin::AgentCreated;
+            let focus_emulation = self
+                .enable_domains_for_origin(&session_id, origin)
                 .await?;
-
             let tab_id = self.next_tab_id;
             self.next_tab_id += 1;
             self.pages.push(PageInfo {
                 tab_id,
                 label: None,
-                target_id: result.target_id,
-                session_id: attach_result.session_id.clone(),
+                target_id,
+                session_id,
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                origin,
+                created_in_background,
+                focus_emulation,
+                chrome_foreground: !created_in_background,
             });
             self.active_page_index = 0;
             self.bind_active_target();
-            self.enable_domains(&attach_result.session_id).await?;
         } else {
             for target in &page_targets {
                 let attach_result: AttachToTargetResult = self
@@ -952,6 +1025,10 @@ impl BrowserManager {
                     url: target.url.clone(),
                     title: target.title.clone(),
                     target_type: target.target_type.clone(),
+                    origin: TargetOrigin::UserDiscovered,
+                    created_in_background: false,
+                    focus_emulation: false,
+                    chrome_foreground: false,
                 });
             }
 
@@ -967,14 +1044,40 @@ impl BrowserManager {
             let active = match self.find_live_page_index(&session_ids).await {
                 Some(index) => index,
                 None => {
-                    // No live tab to fall back to: revive the first one. There
-                    // is no active dialog at connect time, so dialog_session is
-                    // None. The RendererState is discarded; we only need it to
-                    // not error (an unrevivable tab fails connect fast).
-                    let target_id = self.pages[0].target_id.clone();
-                    self.ensure_renderer_alive(&session_ids[0], &target_id, None)
-                        .await?;
-                    0
+                    // No live tab. Under AlwaysQuiet never activateTarget —
+                    // open a quiet blank agent tab instead of stealing focus
+                    // via Memory Saver revival.
+                    if self.raise_policy.is_always_quiet() {
+                        let (target_id, session_id, created_in_background) = self
+                            .create_and_attach_target("about:blank", None)
+                            .await?;
+                        let origin = TargetOrigin::AgentCreated;
+                        let focus_emulation = self
+                            .enable_domains_for_origin(&session_id, origin)
+                            .await?;
+                        let tab_id = self.next_tab_id;
+                        self.next_tab_id += 1;
+                        self.pages.push(PageInfo {
+                            tab_id,
+                            label: None,
+                            target_id,
+                            session_id: session_id.clone(),
+                            url: "about:blank".to_string(),
+                            title: String::new(),
+                            target_type: "page".to_string(),
+                            origin,
+                            created_in_background,
+                            focus_emulation,
+                            chrome_foreground: false,
+                        });
+                        self.pages.len() - 1
+                    } else {
+                        // Headed launch path: revive the first one (documented).
+                        let target_id = self.pages[0].target_id.clone();
+                        self.ensure_renderer_alive(&session_ids[0], &target_id, None)
+                            .await?;
+                        0
+                    }
                 }
             };
             self.active_page_index = active;
@@ -1173,37 +1276,22 @@ impl BrowserManager {
 
     /// Create and attach a blank target, returning `(target_id, session_id)`.
     async fn open_blank_target(&self) -> Result<(String, String), String> {
-        let created: CreateTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: "about:blank".to_string(),
-                },
-                None,
-            )
+        let (target_id, session_id, _bg) = self
+            .create_and_attach_target("about:blank", None)
             .await?;
-        let attach: AttachToTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: created.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
+        // open_blank_target is an agent recovery path → AgentCreated.
+        let _ = self
+            .enable_domains_for_origin(&session_id, TargetOrigin::AgentCreated)
             .await?;
-        self.enable_domains(&attach.session_id).await?;
-        Ok((created.target_id, attach.session_id))
+        Ok((target_id, session_id))
     }
 
+
     /// Ensure the tab's renderer can serve commands. A non-responsive renderer
-    /// is reactivated with Target.activateTarget, which reloads a genuinely
-    /// discarded tab but only focuses a live one, so a probe false positive
-    /// cannot lose page state, and it answers promptly rather than riding the
-    /// renderer command timeout. A tab paused by a JavaScript dialog is alive
-    /// and reported as blocked, not revived.
+    /// is reactivated with Target.activateTarget **only** under
+    /// AllowForegroundCreate. Under AlwaysQuiet the quiet path refuses
+    /// implicit activateTarget (focus steal); callers must use `revive_tab`
+    /// for an intentional Memory Saver revival.
     async fn ensure_renderer_alive(
         &self,
         session_id: &str,
@@ -1221,6 +1309,12 @@ impl BrowserManager {
         if dialog_session == Some(session_id) {
             return Ok(RendererState::DialogBlocked);
         }
+        if !self.raise_policy.allows_implicit_activate_target() {
+            return Err(format!(
+                "renderer_discarded: tab is not responding (target {}); Memory Saver                  may have discarded it. Quiet attach refuses Target.activateTarget                  (focus steal). Run `agent-browser revive-tab` for an intentional                  revive, or `agent-browser tab new` for a quiet fresh tab",
+                target_id
+            ));
+        }
         match tokio::time::timeout(
             Duration::from_millis(REVIVED_RENDERER_TIMEOUT_MS),
             self.client.send_command(
@@ -1234,14 +1328,12 @@ impl BrowserManager {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 return Err(format!(
-                    "tab is not responding and Target.activateTarget \
-                     failed: {}",
+                    "tab is not responding and Target.activateTarget                      failed: {}",
                     e
                 ))
             }
             Err(_) => {
-                return Err("tab is not responding and Target.activateTarget \
-                     timed out"
+                return Err("tab is not responding and Target.activateTarget                      timed out"
                     .to_string())
             }
         }
@@ -1254,6 +1346,7 @@ impl BrowserManager {
             Err("tab is not responding and did not recover after activation".to_string())
         }
     }
+
 
     /// Index of the lowest-numbered page whose renderer answers a liveness
     /// probe, or `None` if every tab is discarded. The conventional active tab
@@ -1746,6 +1839,74 @@ impl BrowserManager {
         self.browser_process.is_none()
     }
 
+    pub fn raise_policy(&self) -> RaisePolicy {
+        self.raise_policy
+    }
+
+    /// Test/override hook: headed-launch revival tests set AllowForegroundCreate
+    /// after an attach-shaped connect_cdp mock.
+    #[cfg(test)]
+    pub fn set_raise_policy(&mut self, policy: RaisePolicy) {
+        self.raise_policy = policy;
+    }
+
+    /// Sole createTarget entry for Quiet/Foreground policy.
+    /// AlwaysQuiet → background:true; AllowForegroundCreate → omit background.
+    async fn create_and_attach_target(
+        &self,
+        url: &str,
+        browser_context_id: Option<String>,
+    ) -> Result<(String, String, bool), String> {
+        let background = self.raise_policy.creates_in_background();
+        let result: CreateTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.createTarget",
+                &CreateTargetParams {
+                    url: url.to_string(),
+                    background: if background { Some(true) } else { None },
+                    browser_context_id,
+                },
+                None,
+            )
+            .await?;
+        let attach: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: result.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+        Ok((result.target_id, attach.session_id, background))
+    }
+
+    /// Enable CDP domains; under AlwaysQuiet + AgentCreated also enable focus emulation.
+    async fn enable_domains_for_origin(
+        &self,
+        session_id: &str,
+        origin: TargetOrigin,
+    ) -> Result<bool, String> {
+        self.enable_domains(session_id).await?;
+        let mut focus_emulation = false;
+        if self.raise_policy.is_always_quiet() && matches!(origin, TargetOrigin::AgentCreated) {
+            let _ = self
+                .client
+                .send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": true })),
+                    Some(session_id),
+                )
+                .await;
+            focus_emulation = true;
+        }
+        Ok(focus_emulation)
+    }
+
+
     pub fn is_direct_page_connection(&self) -> bool {
         self.direct_page
     }
@@ -1763,27 +1924,12 @@ impl BrowserManager {
             return Ok(());
         }
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: "about:blank".to_string(),
-                },
-                None,
-            )
+        let (target_id, session_id, created_in_background) = self
+            .create_and_attach_target("about:blank", None)
             .await?;
-
-        let attach_result: AttachToTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
+        let origin = TargetOrigin::AgentCreated;
+        let focus_emulation = self
+            .enable_domains_for_origin(&session_id, origin)
             .await?;
 
         let tab_id = self.next_tab_id;
@@ -1791,18 +1937,22 @@ impl BrowserManager {
         self.pages.push(PageInfo {
             tab_id,
             label: None,
-            target_id: result.target_id,
-            session_id: attach_result.session_id.clone(),
+            target_id,
+            session_id,
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            origin,
+            created_in_background,
+            focus_emulation,
+            chrome_foreground: !created_in_background,
         });
         self.active_page_index = 0;
         self.bind_active_target();
-        self.enable_domains(&attach_result.session_id).await?;
 
         Ok(())
     }
+
 
     // -----------------------------------------------------------------------
     // Tab management
@@ -1936,44 +2086,31 @@ impl BrowserManager {
 
         let target_url = url.unwrap_or("about:blank");
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: target_url.to_string(),
-                },
-                None,
-            )
+        let (created_target_id, session_id, created_in_background) = self
+            .create_and_attach_target(target_url, None)
             .await?;
-
-        let attach: AttachToTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
+        let origin = TargetOrigin::AgentCreated;
+        let focus_emulation = self
+            .enable_domains_for_origin(&session_id, origin)
             .await?;
-
-        self.enable_domains(&attach.session_id).await?;
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
         let index = self.pages.len();
         let label = label.map(|s| s.to_string());
-        let target_id = result.target_id.clone();
+        let target_id = created_target_id.clone();
         self.pages.push(PageInfo {
             tab_id,
             label: label.clone(),
-            target_id: result.target_id,
-            session_id: attach.session_id,
+            target_id: created_target_id,
+            session_id,
             url: target_url.to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            origin,
+            created_in_background,
+            focus_emulation,
+            chrome_foreground: !created_in_background,
         });
         self.active_page_index = index;
         self.bind_active_target();
@@ -2019,11 +2156,17 @@ impl BrowserManager {
         // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
 
-        // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        // AlwaysQuiet: agent routing only — never implicit Page.bringToFront.
+        // AllowForegroundCreate (headed launch): keep today's raise-on-switch.
+        if self.raise_policy.allows_implicit_bring_to_front() {
+            let _ = self
+                .client
+                .send_command("Page.bringToFront", None, Some(&session_id))
+                .await;
+            if let Some(page) = self.pages.get_mut(index) {
+                page.chrome_foreground = true;
+            }
+        }
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
@@ -2230,12 +2373,84 @@ impl BrowserManager {
         Ok(())
     }
 
-    pub async fn bring_to_front(&self) -> Result<(), String> {
-        let session_id = self.active_session_id()?;
+    /// Sole intentional Chrome raise. CLI/MCP `bringtofront` is the only
+    /// public path that should call this under AlwaysQuiet.
+    pub async fn bring_to_front(&mut self) -> Result<(), String> {
+        let session_id = self.active_session_id()?.to_string();
         self.client
-            .send_command("Page.bringToFront", None, Some(session_id))
+            .send_command("Page.bringToFront", None, Some(&session_id))
             .await?;
+        if let Some(page) = self.pages.get_mut(self.active_page_index) {
+            page.chrome_foreground = true;
+        }
         Ok(())
+    }
+
+    /// Explicit Memory Saver revival via Target.activateTarget (documented
+    /// focus steal). Quiet attach refuses this implicitly; this is the only
+    /// intentional revive path.
+    pub async fn revive_tab(
+        &mut self,
+        dialog_session: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let session_id = self.active_session_id()?.to_string();
+        let target_id = self.active_target_id()?.to_string();
+        if self
+            .renderer_responds(&session_id, RENDERER_PROBE_TIMEOUT_MS)
+            .await
+        {
+            return Ok(json!({
+                "revived": false,
+                "reason": "renderer already responsive",
+                "targetId": target_id,
+            }));
+        }
+        if dialog_session == Some(session_id.as_str()) {
+            return Ok(json!({
+                "revived": false,
+                "reason": "dialog blocked",
+                "targetId": target_id,
+            }));
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(REVIVED_RENDERER_TIMEOUT_MS),
+            self.client.send_command(
+                "Target.activateTarget",
+                Some(json!({ "targetId": target_id })),
+                None,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "revive-tab: Target.activateTarget failed: {}",
+                    e
+                ))
+            }
+            Err(_) => {
+                return Err("revive-tab: Target.activateTarget timed out".to_string())
+            }
+        }
+        if !self
+            .renderer_responds(&session_id, REVIVED_RENDERER_TIMEOUT_MS)
+            .await
+        {
+            return Err(
+                "revive-tab: tab did not recover after Target.activateTarget".to_string(),
+            );
+        }
+        self.enable_domains(&session_id).await?;
+        if let Some(page) = self.pages.get_mut(self.active_page_index) {
+            page.chrome_foreground = true;
+        }
+        Ok(json!({
+            "revived": true,
+            "targetId": target_id,
+            "focusSteal": true,
+            "note": "Target.activateTarget raises the tab in Chrome (documented steal)",
+        }))
     }
 
     pub async fn set_timezone(&self, timezone_id: &str) -> Result<(), String> {
@@ -2520,6 +2735,10 @@ impl BrowserManager {
                 url,
                 title,
                 target_type,
+                origin: TargetOrigin::UserDiscovered,
+                created_in_background: false,
+                focus_emulation: false,
+                chrome_foreground: false,
             },
             activate,
         );
@@ -2724,6 +2943,7 @@ async fn initialize_lightpanda_manager(
             bound_target_gone: None,
             wedge_suspect: None,
             headless: true,
+            raise_policy: RaisePolicy::AlwaysQuiet,
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
@@ -2834,6 +3054,7 @@ async fn initialize_obscura_manager(
             bound_target_gone: None,
             wedge_suspect: None,
             headless: true,
+            raise_policy: RaisePolicy::AlwaysQuiet,
         };
 
         match run_with_obscura_deadline(
@@ -3227,6 +3448,10 @@ mod tests {
             url: String::new(),
             title: String::new(),
             target_type: "page".to_string(),
+            origin: TargetOrigin::UserDiscovered,
+            created_in_background: false,
+            focus_emulation: false,
+            chrome_foreground: false,
         }];
         let target = TargetInfo {
             target_id: "popup-1".to_string(),
@@ -3686,15 +3911,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn page(tab_id: u32, target_id: &str, url: &str) -> PageInfo {
-        PageInfo {
+        PageInfo::new(
             tab_id,
-            label: None,
-            target_id: target_id.to_string(),
-            session_id: format!("session-{}", tab_id),
-            url: url.to_string(),
-            title: String::new(),
-            target_type: "page".to_string(),
-        }
+            target_id,
+            format!("session-{}", tab_id),
+            url,
+            String::new(),
+            "page",
+        )
     }
 
     /// Build a `BrowserManager` backed by a dummy WebSocket server that
@@ -3738,6 +3962,7 @@ mod tests {
             bound_target_gone: None,
             wedge_suspect: None,
             headless: true,
+            raise_policy: RaisePolicy::AlwaysQuiet,
         }
     }
 
@@ -3799,6 +4024,7 @@ mod tests {
             bound_target_gone: None,
             wedge_suspect: None,
             headless: true,
+            raise_policy: RaisePolicy::AlwaysQuiet,
         };
         manager.close().await.unwrap();
 
@@ -4983,6 +5209,8 @@ mod tests {
     async fn test_tab_switch_revives_discarded_tab() {
         let url = start_mock_cdp_browser_with_discarded_tab(true).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        // Headed-launch semantics: implicit activateTarget on switch.
+        mgr.set_raise_policy(RaisePolicy::AllowForegroundCreate);
         assert_eq!(mgr.pages.len(), 2);
         assert_eq!(mgr.active_page_index, 0);
 
@@ -5000,6 +5228,27 @@ mod tests {
         assert_eq!(mgr.active_page_index, 1);
     }
 
+    /// AlwaysQuiet attach: tab switch must refuse implicit activateTarget and
+    /// leave active_page_index unchanged when the target is discarded.
+    #[tokio::test]
+    async fn test_tab_switch_always_quiet_refuses_activate_target() {
+        let url = start_mock_cdp_browser_with_discarded_tab(true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert!(mgr.raise_policy().is_always_quiet());
+
+        let err = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect_err("AlwaysQuiet must refuse implicit activateTarget");
+
+        assert!(
+            err.contains("Quiet attach refuses Target.activateTarget")
+                || err.contains("renderer_discarded"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(mgr.active_page_index, 0);
+    }
+
     /// Regression test for #1528: when the dead tab cannot be revived, the
     /// switch must fail fast with a clear error and must NOT leave
     /// active_page_index pointing at the dead tab, which would wedge every
@@ -5008,6 +5257,7 @@ mod tests {
     async fn test_tab_switch_to_dead_tab_fails_without_poisoning_active_tab() {
         let url = start_mock_cdp_browser_with_discarded_tab(false).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        mgr.set_raise_policy(RaisePolicy::AllowForegroundCreate);
 
         let err = tokio::time::timeout(Duration::from_secs(25), mgr.tab_switch(1, None))
             .await
@@ -5130,6 +5380,7 @@ mod tests {
     async fn test_tab_switch_cancelled_probe_leaves_no_pending_request() {
         let url = start_mock_cdp_browser_with_discarded_tab(true).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        mgr.set_raise_policy(RaisePolicy::AllowForegroundCreate);
 
         let _ = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
             .await
@@ -5268,6 +5519,7 @@ mod tests {
     async fn test_tab_close_revives_discarded_successor() {
         let url = start_mock_cdp_browser_with_discarded_tab(true).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        mgr.set_raise_policy(RaisePolicy::AllowForegroundCreate);
         assert_eq!(mgr.pages.len(), 2);
         assert_eq!(mgr.active_page_index, 0);
 
@@ -5386,6 +5638,10 @@ mod tests {
 
                 let reply = match method {
                     "Target.getTargets" => Some(respond(json!({ "targetInfos": target_infos }))),
+                    "Target.createTarget" => {
+                        // AlwaysQuiet all-discarded path creates a quiet blank.
+                        Some(respond(json!({ "targetId": "T-QUIET-BLANK" })))
+                    }
                     "Target.attachToTarget" => {
                         let target = cmd["params"]["targetId"].as_str().unwrap_or("");
                         Some(respond(json!({ "sessionId": format!("S-{}", target) })))
@@ -5400,8 +5656,10 @@ mod tests {
                         Some(respond(json!({})))
                     }
                     // A discarded session (not alive, not yet revived) never
-                    // answers any renderer-bound command.
+                    // answers any renderer-bound command. Quiet-created blanks
+                    // (S-T-QUIET-BLANK) are live.
                     _ if !session.is_empty()
+                        && session != "S-T-QUIET-BLANK"
                         && !alive_sessions.contains(&session)
                         && !revived.contains(&session) =>
                     {
@@ -5479,9 +5737,9 @@ mod tests {
         );
     }
 
-    /// When every tab is discarded there is no live tab to fall back to, so
-    /// connect must revive the first tab (browser-level `Target.activateTarget`,
-    /// bounded) rather than hang, and succeed (#1036).
+    /// When every tab is discarded on AlwaysQuiet attach, connect must NOT
+    /// steal focus via Target.activateTarget. It opens a quiet blank agent tab
+    /// instead (#1036 + AlwaysQuiet).
     #[tokio::test]
     async fn test_connect_all_discarded_revives_first_tab() {
         let (url, activations) = start_mock_cdp_connect(vec![("ONLY", false)], true).await;
@@ -5489,12 +5747,20 @@ mod tests {
         let mgr = tokio::time::timeout(Duration::from_secs(20), BrowserManager::connect_cdp(&url))
             .await
             .expect("connect must not hang when all tabs are discarded")
-            .expect("connect should succeed after reviving the only tab");
+            .expect("connect should succeed by creating a quiet blank tab");
 
-        assert_eq!(mgr.active_page_index, 0);
         assert!(
-            activations.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            "the only (discarded) tab must be revived when there is no live fallback"
+            mgr.pages.len() >= 2,
+            "quiet blank agent tab should be appended alongside discarded targets"
+        );
+        assert_eq!(
+            activations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "AlwaysQuiet attach must not Target.activateTarget on all-discarded connect"
+        );
+        assert!(
+            mgr.pages.iter().any(|p| p.created_in_background && p.url == "about:blank"),
+            "expected an agent-created quiet about:blank page"
         );
     }
 
@@ -5509,6 +5775,7 @@ mod tests {
         let mut mgr = BrowserManager::connect_cdp(&url)
             .await
             .expect("connect should select the live tab");
+        mgr.set_raise_policy(RaisePolicy::AllowForegroundCreate);
         let activations_after_connect = activations.load(std::sync::atomic::Ordering::SeqCst);
 
         // Re-select the discarded tab the way the restore path does.
@@ -5525,21 +5792,27 @@ mod tests {
         );
     }
 
-    /// If every tab is discarded and cannot be revived, connect must fail fast
-    /// with a clear error instead of hanging (#1036).
+    /// AlwaysQuiet attach: even when discarded tabs cannot be revived, connect
+    /// succeeds by creating a quiet blank agent tab (no activateTarget steal).
     #[tokio::test]
     async fn test_connect_all_discarded_unrevivable_fails_fast() {
-        let (url, _activations) = start_mock_cdp_connect(vec![("ONLY", false)], false).await;
+        let (url, activations) = start_mock_cdp_connect(vec![("ONLY", false)], false).await;
 
-        let result =
+        let mgr =
             tokio::time::timeout(Duration::from_secs(30), BrowserManager::connect_cdp(&url))
                 .await
-                .expect("connect must not hang on an unrevivable discarded tab");
+                .expect("connect must not hang on an unrevivable discarded tab")
+                .expect("AlwaysQuiet should open a quiet blank instead of failing");
 
-        match result {
-            Ok(_) => panic!("connect should fail when no tab can be made live"),
-            Err(e) => assert!(e.contains("not responding"), "unexpected error: {}", e),
-        }
+        assert!(
+            mgr.pages.iter().any(|p| p.created_in_background),
+            "expected quiet blank creation when discarded tabs are unrevivable"
+        );
+        assert_eq!(
+            activations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "must not activateTarget under AlwaysQuiet"
+        );
     }
 
     /// Adversarial regression for the #1528 failure mode, on the connect path:
