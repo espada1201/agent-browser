@@ -1074,7 +1074,7 @@ impl BrowserManager {
                     } else {
                         // Headed launch path: revive the first one (documented).
                         let target_id = self.pages[0].target_id.clone();
-                        self.ensure_renderer_alive(&session_ids[0], &target_id, None)
+                        self.ensure_renderer_alive(&session_ids[0], &target_id, None, false)
                             .await?;
                         0
                     }
@@ -1095,7 +1095,7 @@ impl BrowserManager {
     pub async fn revive_and_enable_active(&self) -> Result<(), String> {
         let session_id = self.active_session_id()?.to_string();
         let target_id = self.active_target_id()?.to_string();
-        self.ensure_renderer_alive(&session_id, &target_id, None)
+        self.ensure_renderer_alive(&session_id, &target_id, None, false)
             .await?;
         self.enable_domains(&session_id).await
     }
@@ -1288,15 +1288,17 @@ impl BrowserManager {
 
 
     /// Ensure the tab's renderer can serve commands. A non-responsive renderer
-    /// is reactivated with Target.activateTarget **only** under
-    /// AllowForegroundCreate. Under AlwaysQuiet the quiet path refuses
-    /// implicit activateTarget (focus steal); callers must use `revive_tab`
-    /// for an intentional Memory Saver revival.
+    /// is reactivated with Target.activateTarget under AllowForegroundCreate,
+    /// or when `intentional_activate` is true (documented steal prelude for
+    /// `bringtofront`). Under AlwaysQuiet the quiet path refuses *implicit*
+    /// activateTarget; callers must pass `intentional_activate` or use
+    /// `revive_tab`.
     async fn ensure_renderer_alive(
         &self,
         session_id: &str,
         target_id: &str,
         dialog_session: Option<&str>,
+        intentional_activate: bool,
     ) -> Result<RendererState, String> {
         if self
             .renderer_responds(session_id, RENDERER_PROBE_TIMEOUT_MS)
@@ -1309,9 +1311,9 @@ impl BrowserManager {
         if dialog_session == Some(session_id) {
             return Ok(RendererState::DialogBlocked);
         }
-        if !self.raise_policy.allows_implicit_activate_target() {
+        if !(intentional_activate || self.raise_policy.allows_implicit_activate_target()) {
             return Err(format!(
-                "renderer_discarded: tab is not responding (target {}); Memory Saver                  may have discarded it. Quiet attach refuses Target.activateTarget                  (focus steal). Run `agent-browser revive-tab` for an intentional                  revive, or `agent-browser tab new` for a quiet fresh tab",
+                "renderer_discarded: tab is not responding (target {}); Memory Saver may have discarded it. Quiet attach refuses Target.activateTarget (focus steal). Run `agent-browser bringtofront <tabId>` or `agent-browser revive-tab` for an intentional revive, or `agent-browser tab new` for a quiet fresh tab",
                 target_id
             ));
         }
@@ -2129,6 +2131,25 @@ impl BrowserManager {
         index: usize,
         dialog_session: Option<&str>,
     ) -> Result<Value, String> {
+        self.tab_switch_with_activate(index, dialog_session, false).await
+    }
+
+    /// Switch that may `Target.activateTarget` under AlwaysQuiet — prelude for
+    /// the documented intentional steal (`bringtofront` with an optional tab).
+    pub async fn tab_switch_for_intentional_raise(
+        &mut self,
+        index: usize,
+        dialog_session: Option<&str>,
+    ) -> Result<Value, String> {
+        self.tab_switch_with_activate(index, dialog_session, true).await
+    }
+
+    async fn tab_switch_with_activate(
+        &mut self,
+        index: usize,
+        dialog_session: Option<&str>,
+        intentional_activate: bool,
+    ) -> Result<Value, String> {
         if index >= self.pages.len() {
             return Err(format!(
                 "Tab index {} out of range (0-{})",
@@ -2141,8 +2162,9 @@ impl BrowserManager {
         let target_id = self.pages[index].target_id.clone();
         // A discarded tab has no renderer to answer Page.enable, so revive it
         // first and commit the switch only once it is usable.
+        // intentional_activate=true: bringtofront prelude may steal (documented).
         let renderer_state = self
-            .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+            .ensure_renderer_alive(&session_id, &target_id, dialog_session, intentional_activate)
             .await
             .map_err(|e| {
                 format!(
@@ -2257,20 +2279,54 @@ impl BrowserManager {
         if !self.bound_target_is_gone() {
             // The close has already committed. The tab that becomes active may
             // itself be discarded, which would hang enable_domains; revive it
-            // first. A successor that cannot revive must not turn the completed
-            // close into a reported failure, so its error is not propagated.
+            // first under AllowForegroundCreate. Under AlwaysQuiet, implicit
+            // activateTarget is refused — fall back to a quiet blank agent tab
+            // so agent-active stays operable (never hang Runtime.evaluate).
             let session_id = self.pages[self.active_page_index].session_id.clone();
             let target_id = self.pages[self.active_page_index].target_id.clone();
-            if let Ok(state) = self
-                .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+            match self
+                .ensure_renderer_alive(&session_id, &target_id, dialog_session, false)
                 .await
             {
-                // Best-effort: enabling domains on the successor must not turn
-                // the completed close into a reported failure either.
-                let _ = self.enable_domains(&session_id).await;
-                // Surface a reload of the newly active tab, mirroring tab switch.
-                if matches!(state, RendererState::Revived) {
-                    result["activeTabRevived"] = json!(true);
+                Ok(state) => {
+                    // Best-effort: enabling domains on the successor must not turn
+                    // the completed close into a reported failure either.
+                    let _ = self.enable_domains(&session_id).await;
+                    if matches!(state, RendererState::Revived) {
+                        result["activeTabRevived"] = json!(true);
+                    }
+                }
+                Err(_) if self.raise_policy.is_always_quiet() => {
+                    match self.open_blank_target().await {
+                        Ok((new_tid, new_sid)) => {
+                            let tab_id = self.next_tab_id;
+                            self.next_tab_id += 1;
+                            self.pages.push(PageInfo {
+                                tab_id,
+                                label: None,
+                                target_id: new_tid.clone(),
+                                session_id: new_sid,
+                                url: "about:blank".to_string(),
+                                title: String::new(),
+                                target_type: "page".to_string(),
+                                origin: TargetOrigin::AgentCreated,
+                                created_in_background: true,
+                                focus_emulation: true,
+                                chrome_foreground: false,
+                            });
+                            self.active_page_index = self.pages.len() - 1;
+                            self.bind_active_target();
+                            result["quietBlankCreated"] = json!(true);
+                            result["activeTargetId"] = json!(new_tid);
+                        }
+                        Err(e) => {
+                            result["successorUnusable"] = json!(true);
+                            result["successorError"] = json!(e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Headed unrevivable successor: close already committed.
                 }
             }
         }
@@ -2374,9 +2430,15 @@ impl BrowserManager {
     }
 
     /// Sole intentional Chrome raise. CLI/MCP `bringtofront` is the only
-    /// public path that should call this under AlwaysQuiet.
+    /// public path that should call this under AlwaysQuiet. May
+    /// `Target.activateTarget` first when the active tab was Memory-Saver
+    /// discarded (documented steal).
     pub async fn bring_to_front(&mut self) -> Result<(), String> {
         let session_id = self.active_session_id()?.to_string();
+        let target_id = self.active_target_id()?.to_string();
+        self.ensure_renderer_alive(&session_id, &target_id, None, true)
+            .await
+            .map_err(|e| format!("bringtofront: {}", e))?;
         self.client
             .send_command("Page.bringToFront", None, Some(&session_id))
             .await?;
@@ -2611,6 +2673,20 @@ impl BrowserManager {
             .position(|p| p.tab_id == tab_id)
             .ok_or_else(|| format!("Tab ID {} not found", tab_id))?;
         self.tab_switch(index, dialog_session).await
+    }
+
+    /// See [`Self::tab_switch_for_intentional_raise`].
+    pub async fn tab_switch_by_id_for_intentional_raise(
+        &mut self,
+        tab_id: u32,
+        dialog_session: Option<&str>,
+    ) -> Result<Value, String> {
+        let index = self
+            .pages
+            .iter()
+            .position(|p| p.tab_id == tab_id)
+            .ok_or_else(|| format!("Tab ID {} not found", tab_id))?;
+        self.tab_switch_for_intentional_raise(index, dialog_session).await
     }
 
     pub async fn tab_close_by_id(
@@ -5171,6 +5247,10 @@ mod tests {
                             },
                         ]
                     }))),
+                    "Target.createTarget" => {
+                        // AlwaysQuiet tab_close successor fallback / quiet blank.
+                        Some(respond(json!({ "targetId": "T-QUIET-BLANK" })))
+                    }
                     "Target.attachToTarget" => {
                         let target = cmd["params"]["targetId"].as_str().unwrap_or("");
                         Some(respond(json!({ "sessionId": format!("S-{}", target) })))
@@ -5185,7 +5265,8 @@ mod tests {
                         Some(respond(json!({})))
                     }
                     // Renderer-bound commands on the discarded session never
-                    // get any response until the tab is revived.
+                    // get any response until the tab is revived. Quiet blanks
+                    // (S-T-QUIET-BLANK) stay live.
                     _ if session == "S-T-DISCARDED" && !revived => None,
                     "Runtime.evaluate" => Some(respond(
                         json!({ "result": { "type": "string", "value": "https://discarded.test/" } }),
@@ -5538,14 +5619,139 @@ mod tests {
         assert_eq!(mgr.pages.len(), 1);
     }
 
+
+    /// B1 regression: bringtofront prelude must reach a Memory-Saver-discarded
+    /// tab via intentional activateTarget (documented steal). Quiet tab_switch
+    /// still refuses; intentional raise path must succeed.
+    #[tokio::test]
+    async fn adversary_b_bringtofront_prelude_blocked_on_discarded() {
+        let url = start_mock_cdp_browser_with_discarded_tab(true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert!(mgr.raise_policy().is_always_quiet());
+        let discarded_id = mgr.pages[1].tab_id;
+
+        // Quiet switch still refuses (control).
+        let quiet_err = tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.tab_switch_by_id(discarded_id, None),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("quiet switch must still refuse activateTarget");
+        assert!(
+            quiet_err.contains("Quiet attach refuses Target.activateTarget")
+                || quiet_err.contains("renderer_discarded"),
+            "unexpected quiet err: {quiet_err}"
+        );
+        assert_eq!(mgr.active_page_index, 0);
+
+        // Intentional raise prelude (bringtofront path) must reach discarded.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            mgr.tab_switch_by_id_for_intentional_raise(discarded_id, None),
+        )
+        .await
+        .expect("must not hang")
+        .expect("intent: bringtofront prelude must reach discarded tab");
+        assert_eq!(mgr.pages[mgr.active_page_index].target_id, "T-DISCARDED");
+
+        // bring_to_front on the now-active discarded/revived tab succeeds.
+        tokio::time::timeout(Duration::from_secs(10), mgr.bring_to_front())
+            .await
+            .expect("bring_to_front must not hang")
+            .expect("bring_to_front after intentional switch");
+        assert!(mgr.pages[mgr.active_page_index].chrome_foreground);
+    }
+
+    /// B2 regression: AlwaysQuiet tab_close must not leave agent-active on a
+    /// discarded successor that never answers. Quiet blank fallback keeps
+    /// Runtime.evaluate operable.
+    #[tokio::test]
+    async fn adversary_b_alwaysquiet_tab_close_successor_discarded() {
+        let url = start_mock_cdp_browser_with_discarded_tab(true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert!(mgr.raise_policy().is_always_quiet());
+        assert_eq!(mgr.active_page_index, 0);
+
+        let close = tokio::time::timeout(Duration::from_secs(20), mgr.tab_close(Some(0), None))
+            .await
+            .expect("close must not hang")
+            .expect("close itself should succeed");
+        assert_eq!(close["closed"], json!(true));
+        assert_eq!(
+            close["quietBlankCreated"],
+            json!(true),
+            "AlwaysQuiet close onto discarded successor must create quiet blank; close={close}"
+        );
+        assert!(
+            mgr.pages.iter().any(|p| p.target_id == "T-DISCARDED"),
+            "discarded successor should remain in the page list"
+        );
+        let active = &mgr.pages[mgr.active_page_index];
+        assert_eq!(active.target_id, "T-QUIET-BLANK");
+
+        let eval = tokio::time::timeout(
+            Duration::from_secs(8),
+            mgr.client.send_command(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": "1+1",
+                    "returnByValue": true
+                })),
+                Some(&active.session_id),
+            ),
+        )
+        .await;
+        assert!(
+            eval.is_ok() && eval.as_ref().unwrap().is_ok(),
+            "intent: agent-active after close must answer commands; got {eval:?}; close={close}"
+        );
+    }
+
+    /// Control: explicit revive_tab on already-active discarded still works.
+    #[tokio::test]
+    async fn adversary_b_control_revive_tab_on_active_discarded_works() {
+        let url = start_mock_cdp_browser_with_discarded_tab(true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert!(mgr.raise_policy().is_always_quiet());
+        mgr.active_page_index = 1;
+        mgr.bind_active_target();
+        assert_eq!(mgr.pages[mgr.active_page_index].target_id, "T-DISCARDED");
+
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.revive_tab(None))
+            .await
+            .expect("revive must not hang")
+            .expect("revive_tab on active discarded must activateTarget");
+        assert_eq!(result["revived"], json!(true));
+        assert_eq!(result["focusSteal"], json!(true));
+
+        let eval = tokio::time::timeout(
+            Duration::from_secs(8),
+            mgr.client.send_command(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": "1+1",
+                    "returnByValue": true
+                })),
+                Some(&mgr.pages[1].session_id),
+            ),
+        )
+        .await;
+        assert!(
+            eval.is_ok() && eval.as_ref().unwrap().is_ok(),
+            "revived discarded must answer; got {eval:?}"
+        );
+    }
+
     /// Once the close has committed, a successor that cannot revive must not
-    /// turn the completed close into a reported failure: the closed tab is
-    /// already gone, so reporting an error would leave the caller unable to
-    /// retry.
+    /// turn the completed close into a reported failure. Under AlwaysQuiet the
+    /// successor is replaced with a quiet blank agent tab so agent-active stays
+    /// operable (never hang Runtime.evaluate on the discarded tab).
     #[tokio::test]
     async fn test_tab_close_succeeds_even_if_successor_unrevivable() {
         let url = start_mock_cdp_browser_with_discarded_tab(false).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert!(mgr.raise_policy().is_always_quiet());
         assert_eq!(mgr.pages.len(), 2);
 
         let result = tokio::time::timeout(Duration::from_secs(25), mgr.tab_close(Some(0), None))
@@ -5558,7 +5764,33 @@ mod tests {
             result.get("activeTabRevived").is_none(),
             "an unrevivable successor must not be marked revived"
         );
-        assert_eq!(mgr.pages.len(), 1);
+        assert_eq!(
+            result["quietBlankCreated"],
+            json!(true),
+            "AlwaysQuiet must create a quiet blank when the successor is discarded"
+        );
+        assert!(
+            mgr.pages.len() >= 2,
+            "discarded successor kept + quiet blank appended"
+        );
+        let active = &mgr.pages[mgr.active_page_index];
+        assert_eq!(active.target_id, "T-QUIET-BLANK");
+        let eval = tokio::time::timeout(
+            Duration::from_secs(8),
+            mgr.client.send_command(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": "1+1",
+                    "returnByValue": true
+                })),
+                Some(&active.session_id),
+            ),
+        )
+        .await;
+        assert!(
+            eval.is_ok() && eval.as_ref().unwrap().is_ok(),
+            "quiet blank after close must answer commands; got {eval:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

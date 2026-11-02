@@ -8935,7 +8935,9 @@ async fn handle_styles(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 }
 
 async fn handle_bringtofront(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    // Optional tabId: switch agent routing first (quiet under AlwaysQuiet), then raise.
+    // Optional tabId: switch with intentional activate (documented steal), then raise.
+    // Quiet tab_switch would refuse Memory-Saver-discarded targets; bringtofront
+    // is allowed to Target.activateTarget as prelude to Page.bringToFront.
     if let Some(tab_ref) = cmd.get("tabId").and_then(|v| v.as_str()) {
         let dialog_session = state
             .pending_dialog
@@ -8943,7 +8945,7 @@ async fn handle_bringtofront(cmd: &Value, state: &mut DaemonState) -> Result<Val
             .and_then(|d| d.session_id.clone());
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         let tab_id = mgr.resolve_tab_ref(&super::browser::TabRef::parse(tab_ref)?)?;
-        mgr.tab_switch_by_id(tab_id, dialog_session.as_deref())
+        mgr.tab_switch_by_id_for_intentional_raise(tab_id, dialog_session.as_deref())
             .await?;
     }
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;

@@ -81,9 +81,10 @@ When you attach with `--cdp` / `--auto-connect` (or `connect`), agent-browser us
 
 - `Target.createTarget` always passes `background: true` — new agent tabs do not activate in Chrome.
 - `tab switch` updates agent routing only — it does **not** call `Page.bringToFront`.
-- Memory Saver revival via `Target.activateTarget` is **refused** on the quiet path (would steal focus). Use `revive-tab` when you intentionally accept that steal.
+- Memory Saver revival via `Target.activateTarget` is **refused** on the quiet path (would steal focus). Use `bringtofront <tabId>` or `revive-tab` when you intentionally accept that steal.
 - Agent-created sessions get `Emulation.setFocusEmulationEnabled` automatically so background pages stay operable.
-- The only intentional Chrome raise is `bringtofront` (optional tab ref).
+- The only intentional Chrome raise is `bringtofront` (optional tab ref) — it may `Target.activateTarget` first when the target was Memory-Saver discarded.
+- Closing the agent-active tab onto a discarded successor creates a quiet blank agent tab (`background: true`) so the session stays operable without an implicit steal.
 
 ```bash
 # Dedicated test profile recommended — not your daily browser profile.
@@ -98,7 +99,7 @@ agent-browser --cdp 9222 revive-tab        # intentional Memory Saver activateTa
 
 Launched **headed** agent-owned browsers keep today's foreground-create / raise-on-switch behavior (`AllowForegroundCreate`). There is no public `--background` flag on the happy path — quiet is the attach default.
 
-Residual risks: macOS may still activate Chrome on CDP WebSocket connect (outside this raise gate); discarded tabs need `revive-tab` or a quiet `tab new`.
+Residual risks: macOS may still activate Chrome on CDP WebSocket connect (outside this raise gate); discarded tabs need `bringtofront` / `revive-tab` (intentional) or a quiet `tab new` / quiet blank after close.
 
 ## Tab pinning
 
