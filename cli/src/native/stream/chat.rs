@@ -465,6 +465,8 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "pushstate",
     "removeinitscript",
     "skills",
+    "bringtofront",
+    "revive-tab",
 ];
 
 const CHAT_GLOBAL_FLAGS: &[&str] = &["--json", "--annotate"];

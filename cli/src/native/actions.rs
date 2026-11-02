@@ -16,7 +16,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::a11y;
 use super::auth;
-use super::browser::{should_track_target, BrowserManager, WaitUntil, WedgeReport};
+use super::browser::{should_track_target, BrowserManager, TargetOrigin, WaitUntil, WedgeReport};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -3279,7 +3279,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "setvalue" => handle_setvalue(cmd, state).await,
         "count" => handle_count(cmd, state).await,
         "styles" => handle_styles(cmd, state).await,
-        "bringtofront" => handle_bringtofront(state).await,
+        "bringtofront" => handle_bringtofront(cmd, state).await,
+        "revive_tab" => handle_revive_tab(state).await,
         "timezone" => handle_timezone(cmd, state).await,
         "locale" => handle_locale(cmd, state).await,
         "geolocation" => handle_geolocation(cmd, state).await,
@@ -3665,12 +3666,9 @@ async fn open_fresh_tab_for_auto_connect(state: &mut DaemonState) -> Result<(), 
     let Some(ref mut mgr) = state.browser else {
         return Ok(());
     };
+    // AlwaysQuiet attach: tab_new already creates with background:true and
+    // never raises. Do NOT Page.bringToFront here (was an explicit steal).
     mgr.tab_new(None, None).await?;
-    let session_id = mgr.active_session_id()?.to_string();
-    let _ = mgr
-        .client
-        .send_command("Page.bringToFront", None, Some(&session_id))
-        .await;
     // Best effort: a failed write is retried after the next command.
     let _ = maybe_persist_tab_binding(state);
     Ok(())
@@ -8936,10 +8934,32 @@ async fn handle_styles(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     Ok(json!({ "styles": styles }))
 }
 
-async fn handle_bringtofront(state: &DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+async fn handle_bringtofront(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    // Optional tabId: switch with intentional activate (documented steal), then raise.
+    // Quiet tab_switch would refuse Memory-Saver-discarded targets; bringtofront
+    // is allowed to Target.activateTarget as prelude to Page.bringToFront.
+    if let Some(tab_ref) = cmd.get("tabId").and_then(|v| v.as_str()) {
+        let dialog_session = state
+            .pending_dialog
+            .as_ref()
+            .and_then(|d| d.session_id.clone());
+        let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+        let tab_id = mgr.resolve_tab_ref(&super::browser::TabRef::parse(tab_ref)?)?;
+        mgr.tab_switch_by_id_for_intentional_raise(tab_id, dialog_session.as_deref())
+            .await?;
+    }
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     mgr.bring_to_front().await?;
     Ok(json!({ "broughtToFront": true }))
+}
+
+async fn handle_revive_tab(state: &mut DaemonState) -> Result<Value, String> {
+    let dialog_session = state
+        .pending_dialog
+        .as_ref()
+        .and_then(|d| d.session_id.clone());
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+    mgr.revive_tab(dialog_session.as_deref()).await
 }
 
 async fn handle_timezone(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -11628,11 +11648,16 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             .ok_or("Failed to create browser context")?
             .to_string();
 
+        let background = mgr.raise_policy().creates_in_background();
         let create_result: super::cdp::types::CreateTargetResult = mgr
             .client
             .send_command_typed(
                 "Target.createTarget",
-                &json!({ "url": "about:blank", "browserContextId": context_id }),
+                &super::cdp::types::CreateTargetParams {
+                    url: "about:blank".to_string(),
+                    background: if background { Some(true) } else { None },
+                    browser_context_id: Some(context_id),
+                },
                 None,
             )
             .await?;
@@ -11649,6 +11674,21 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             )
             .await?;
 
+        let origin = TargetOrigin::AgentCreated;
+        // Focus emulation on agent-created under AlwaysQuiet
+        let focus_emulation = if mgr.raise_policy().is_always_quiet() {
+            let _ = mgr
+                .client
+                .send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": true })),
+                    Some(&attach.session_id),
+                )
+                .await;
+            true
+        } else {
+            false
+        };
         mgr.prepare_domains_pub(&attach.session_id).await?;
 
         let tab_id = mgr.assign_tab_id();
@@ -11660,6 +11700,10 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            origin,
+            created_in_background: background,
+            focus_emulation,
+            chrome_foreground: !background,
         });
         (tab_id, attach.session_id)
     };
@@ -17918,6 +17962,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                origin: TargetOrigin::UserDiscovered,
+                created_in_background: false,
+                focus_emulation: false,
+                chrome_foreground: false,
             },
             super::super::browser::PageInfo {
                 tab_id: 2,
@@ -17927,6 +17975,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                origin: TargetOrigin::UserDiscovered,
+                created_in_background: false,
+                focus_emulation: false,
+                chrome_foreground: false,
             },
             super::super::browser::PageInfo {
                 tab_id: 3,
@@ -17936,6 +17988,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                origin: TargetOrigin::UserDiscovered,
+                created_in_background: false,
+                focus_emulation: false,
+                chrome_foreground: false,
             },
         ];
 
@@ -17955,6 +18011,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             url: String::new(),
             title: String::new(),
             target_type: "page".to_string(),
+            origin: TargetOrigin::UserDiscovered,
+            created_in_background: false,
+            focus_emulation: false,
+            chrome_foreground: false,
         }];
 
         assert_eq!(

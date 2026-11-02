@@ -120,6 +120,9 @@ async fn collect_storage_via_temp_target(
             "Target.createTarget",
             &CreateTargetParams {
                 url: "about:blank".to_string(),
+                // Temp storage target must not steal the user's foreground tab.
+                background: Some(true),
+                browser_context_id: None,
             },
             None,
         )

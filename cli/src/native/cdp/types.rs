@@ -141,6 +141,12 @@ pub struct SetDiscoverTargetsParams {
 #[serde(rename_all = "camelCase")]
 pub struct CreateTargetParams {
     pub url: String,
+    /// When Some(true), Chrome creates the target without activating it
+    /// (Chrome DevTools Protocol Target.createTarget.background).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_context_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -585,4 +591,34 @@ pub struct BrowserVersionInfo {
 #[allow(clippy::upper_case_acronyms)]
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/cdp_generated.rs"));
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_target_background_serializes_when_set() {
+        let v = serde_json::to_value(&CreateTargetParams {
+            url: "about:blank".into(),
+            background: Some(true),
+            browser_context_id: None,
+        })
+        .unwrap();
+        assert_eq!(v["url"], "about:blank");
+        assert_eq!(v["background"], true);
+        assert!(v.get("browserContextId").is_none());
+    }
+
+    #[test]
+    fn create_target_omits_background_when_none() {
+        let v = serde_json::to_value(&CreateTargetParams {
+            url: "about:blank".into(),
+            background: None,
+            browser_context_id: None,
+        })
+        .unwrap();
+        assert!(v.get("background").is_none());
+    }
 }
