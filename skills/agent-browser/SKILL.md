@@ -22,6 +22,14 @@ agent-browser skills get core --full      # include full command reference and t
 
 The CLI serves skill content that always matches the installed version, so instructions never go stale. The content in this stub cannot change between releases, which is why it just points at `skills get core`.
 
+
+## FOREGROUND_KEEP / Quiet CDP (hard rules)
+
+1. Never visually switch the user's OS-active browser tab to do agent work. Leave the tab their mouse is on alone.
+2. Agent routing uses Quiet CDP only: AlwaysQuiet / no `Page.bringToFront` on ordinary `tab` / `tab new` / screenshot / click.
+3. `bringtofront` is intentional steal only — when the user asked to park/restore a visible tab, never inside a quiet screenshot/click loop.
+4. Prove background work: park/confirm AppleScript `activeTab` = N, quiet-route other tabs, re-assert `activeTab` still N (`FOREGROUND_KEEP`).
+5. Prefer a dedicated CDP profile/window (side display OK). Never AX-click another tab in the user's same active window.
 ## Specialized skills
 
 Load a specialized skill when the task falls outside browser web pages:

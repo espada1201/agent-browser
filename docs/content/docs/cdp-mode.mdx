@@ -101,6 +101,9 @@ Launched **headed** agent-owned browsers keep today's foreground-create / raise-
 
 Residual risks: macOS may still activate Chrome on CDP WebSocket connect (outside this raise gate); discarded tabs need `bringtofront` / `revive-tab` (intentional) or a quiet `tab new` / quiet blank after close.
 
+
+**FOREGROUND_KEEP:** Never visually switch the user's OS-active browser tab to do agent work — leave the tab their mouse is on alone. Prefer a dedicated CDP profile/window. To prove background work while the user stays on tab N: park/confirm AppleScript `activeTab` = N, quiet-route other tabs (AlwaysQuiet / no `Page.bringToFront` on ordinary `tab` / `tab new` / screenshot / click), then re-assert `activeTab` still N. Use `bringtofront` only as intentional steal when the user asked to park/restore a visible tab — never inside a quiet loop.
+
 ## Tab pinning
 
 When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's.

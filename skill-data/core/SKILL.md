@@ -33,6 +33,10 @@ agent-browser snapshot -i       # 4. Re-snapshot after any page change
 
 Refs (`@e1`, `@e2`, ...) can be reused across snapshots. Take a fresh snapshot after navigation or to observe page changes.
 
+
+## FOREGROUND_KEEP / Quiet CDP (hard rules)
+
+Never visually switch the user's OS-active browser tab to do agent work. Leave the tab their mouse is on alone. On CDP attach, AlwaysQuiet is the default: no `Page.bringToFront` on ordinary `tab` / `tab new` / screenshot / click. `bringtofront` is intentional steal only (user asked to park/restore a visible tab), never part of a quiet loop. Prove background work with AppleScript `activeTab` = N parked, quiet-route other tabs, re-assert `activeTab` still N (`FOREGROUND_KEEP`). Prefer a dedicated CDP profile/window; never AX-click another tab in the user's same active window.
 ## Always use your own session
 
 Before your first command, set a named session for the whole task:
